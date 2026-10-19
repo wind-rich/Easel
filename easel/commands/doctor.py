@@ -123,7 +123,10 @@ def _gateway_healthy() -> bool:
     不是 18789，写死就会「gateway 活着、doctor 报 FAIL」。
     """
     try:
-        with urllib.request.urlopen(healthz_url(), timeout=5) as response:
+        # 127.0.0.1 探针绝不能继承系统 http_proxy（direct_api 同款 doctrine）：
+        # 默认 opener 会把回环请求发给代理，代理不可达时健康的网关被误报为 FAIL。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(healthz_url(), timeout=5) as response:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
@@ -156,6 +159,10 @@ def _env_key_valid() -> bool:
 
     ping 才是权威连通性测试；这里只做静态配置存在性检查。
     """
+    cli_ok, _detail = _primary_model_cli_available()
+    if cli_ok:
+        return True
+
     settings = read_settings(PROJECT_ROOT / ".env")
     if any(settings.get(name, "").strip() for name in (
             "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_MODEL", "EASEL_DIRECT_API_KEY")):
@@ -206,6 +213,40 @@ def _env_key_valid() -> bool:
     return False
 
 
+def _cli_backend(primary: str) -> dict[str, object] | None:
+    if "/" not in primary:
+        return None
+    provider = primary.split("/", 1)[0]
+    try:
+        from easel.local_agents import KNOWN_AGENT_CLIS
+    except Exception:  # noqa: BLE001
+        return None
+    for item in KNOWN_AGENT_CLIS:
+        if item.get("openclaw_provider") == provider:
+            return item
+    return None
+
+
+def _primary_model_cli_available() -> tuple[bool, str]:
+    cfg_path = _openclaw_config_path()
+    if not cfg_path.is_file():
+        return False, ""
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, ""
+    primary = (((cfg.get("agents") or {}).get("defaults") or {})
+               .get("model") or {}).get("primary") or ""
+    backend = _cli_backend(primary)
+    if not backend:
+        return False, ""
+    commands = tuple(backend.get("commands") or ())
+    if any(shutil.which(str(cmd)) for cmd in commands):
+        return True, ""
+    label = backend.get("label") or backend.get("id") or primary.split("/", 1)[0]
+    return False, f"primary 是 {primary}，但未在 PATH 找到 {label} CLI（{', '.join(map(str, commands))}）"
+
+
 def _openclaw_config_path() -> Path:
     """easel 用独立 profile，不碰用户本机的 OpenClaw 配置。
 
@@ -245,6 +286,12 @@ def _primary_model_routable() -> tuple[bool, str]:
         return True, ""
 
     provider = primary.split("/", 1)[0]
+    backend = _cli_backend(primary)
+    if backend:
+        if any(shutil.which(str(cmd)) for cmd in (backend.get("commands") or ())):
+            return True, ""
+        return False, (f"primary 是 {primary}，但未在 PATH 找到 "
+                       f"{backend.get('label') or provider} CLI —— 请先安装并登录后再试")
     providers = (cfg.get("models") or {}).get("providers") or {}
     entry = providers.get(provider)
     if not isinstance(entry, dict):
