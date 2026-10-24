@@ -353,6 +353,79 @@ def _tool_loop_policy() -> list[str]:
     return lines
 
 
+_COMPACTION_RESERVE_FLOOR = 20_000
+
+
+def _compaction_threshold(context_window: int) -> int:
+    """按常见默认预留参数估算压缩阈值（token），不代表运行时保证。"""
+    reserve = min(_COMPACTION_RESERVE_FLOOR, context_window // 4)
+    return context_window - reserve
+
+
+def _context_budget_policy() -> list[str]:
+    """描述已保存的上下文预算配置；不改配置，也不假设运行时已加载。"""
+    try:
+        cfg = json.loads(_openclaw_config_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ["无法读取 JSON 配置；上下文预算状态未知"]
+    if not isinstance(cfg, dict):
+        return ["配置根节点不是对象；上下文预算状态未知"]
+
+    lines: list[str] = []
+    agents = cfg.get("agents")
+    defaults = agents.get("defaults") if isinstance(agents, dict) else None
+    context_cap = defaults.get("contextTokens") if isinstance(defaults, dict) else None
+    if type(context_cap) is not int or context_cap <= 0:
+        context_cap = None
+    compaction = defaults.get("compaction") if isinstance(defaults, dict) else None
+    disabled = isinstance(compaction, dict) and compaction.get("enabled") is False
+    if disabled:
+        lines.append("agents.defaults.compaction.enabled：显式关闭；以下仅为默认参数下的参考阈值")
+    models = cfg.get("models")
+    providers = models.get("providers") if isinstance(models, dict) else None
+    if not isinstance(providers, dict):
+        lines.append("models.providers 未设置；无法计算压缩阈值")
+    else:
+        for provider, spec in sorted(providers.items()):
+            if not isinstance(spec, dict):
+                lines.append(f"{provider}：格式异常；无法计算压缩阈值")
+                continue
+            entries = spec.get("models")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                model_id = str(entry.get("id") or "?")
+                window = entry.get("contextWindow")
+                if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+                    lines.append(f"{provider}/{model_id}：未声明 contextWindow；阈值由 OpenClaw 推导")
+                    continue
+                effective = min(window, context_cap) if context_cap is not None else window
+                cap_note = f"；contextTokens 上限 {context_cap:,}" if context_cap is not None else ""
+                lines.append(f"{provider}/{model_id}：声明 {window:,}{cap_note} → "
+                             f"默认参数参考压缩阈值约 {_compaction_threshold(effective):,}")
+
+    skills = cfg.get("skills")
+    limits = skills.get("limits") if isinstance(skills, dict) else None
+    if not isinstance(limits, dict):
+        lines.append("skills.limits：未设置（技能目录预算走 OpenClaw 默认值）")
+    else:
+        chars = limits.get("maxSkillsPromptChars")
+        count = limits.get("maxSkillsInPrompt")
+        described = []
+        if type(chars) is int and chars > 0:
+            described.append(f"maxSkillsPromptChars={chars:,}")
+        elif chars is not None:
+            described.append("maxSkillsPromptChars 格式异常")
+        if type(count) is int and count > 0:
+            described.append(f"maxSkillsInPrompt={count}")
+        elif count is not None:
+            described.append("maxSkillsInPrompt 格式异常")
+        lines.append("skills.limits：已设置 " + ("，".join(described) if described else "（无可识别字段）"))
+    return lines
+
+
 def cmd_doctor(_args) -> int:
     print("Easel — 环境检查\n")
     all_ok = True
@@ -445,6 +518,11 @@ def cmd_doctor(_args) -> int:
             print(f"    └─ {line}")
         print("    未设置不等于关闭；继承、默认值和运行时支持由 OpenClaw 版本决定。")
         print("    已保存配置不证明网关已加载，也不代表每任务工具调用预算。")
+        print("  OpenClaw 上下文预算（只读配置诊断，不计入环境就绪结果）")
+        for line in _context_budget_policy():
+            print(f"    └─ {line}")
+        print("    阈值按常见默认预留参数估算；所装版本、运行时覆盖和压缩开关可能改变实际行为。")
+        print("    contextWindow 会影响本地请求预算；缓存命中与成本还取决于供应商和提示前缀。")
         # .env 填了 ≠ setup 真的把 provider 写进了 openclaw；不对账就会「doctor 全绿但对话报错」。
         route_ok, route_detail = _primary_model_routable()
         all_ok &= _check("OpenClaw model routing", route_ok, route_detail)
